@@ -1,0 +1,195 @@
+
+services:
+  satis-builder:
+    image: composer:latest
+    volumes:
+      - dist:/build/output
+      - config:/config
+      - satis:/satis
+    environment:
+      SATIS_BUILD_INTERVAL: ${SATIS_BUILD_INTERVAL:-900}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      COMPOSER_HOME: /tmp/composer
+      SATIS_NAME: ${SATIS_NAME:-your-vendor/packages}
+      SATIS_HOMEPAGE: ${SATIS_HOMEPAGE:-https://packages.your-domain.com}
+      SATIS_DESCRIPTION: ${SATIS_DESCRIPTION:-Private Composer Package Repository}
+      SATIS_REPOSITORIES: ${SATIS_REPOSITORIES:-[]}
+    working_dir: /build
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mkdir -p /tmp/composer
+        echo '{}' > /tmp/composer/composer.json
+        
+        if [ -n "$$GITHUB_TOKEN" ]; then
+          echo "✓ Setting up GitHub authentication..."
+          echo "{\"github-oauth\":{\"github.com\":\"$$GITHUB_TOKEN\"}}" > /tmp/composer/auth.json
+        else
+          echo "⚠ WARNING: No GITHUB_TOKEN set - May hit rate limits!"
+        fi
+        
+        if [ ! -f /satis/bin/satis ]; then
+          echo "→ Installing Satis (this may take a few minutes)..."
+          composer create-project composer/satis:dev-main /satis --no-interaction --prefer-dist
+          echo "✓ Satis installed successfully"
+        else
+          echo "✓ Satis already installed"
+        fi
+        
+        echo "Creating satis.json configuration..."
+        
+        # Clean SATIS_REPOSITORIES: remove ALL whitespace (newlines, spaces, tabs) and rebuild JSON compact
+        CLEANED_REPOS=$(echo "$$SATIS_REPOSITORIES" | tr -d '[:space:]')
+        
+        cat > /config/satis.json << EOFCONFIG
+        {
+          "name": "$$SATIS_NAME",
+          "homepage": "$$SATIS_HOMEPAGE",
+          "description": "$$SATIS_DESCRIPTION",
+          "repositories": $$CLEANED_REPOS,
+          "require-all": true,
+          "require-dependencies": true,
+          "require-dev-dependencies": false,
+          "archive": {
+            "directory": "dist",
+            "format": "tar"
+          }
+        }
+        EOFCONFIG
+        
+        echo "Config created successfully"
+        cat /config/satis.json
+        
+        echo "Starting build loop..."
+        while true; do 
+          echo "========================================"
+          echo "Running satis build at $$(date)..."
+          echo "========================================"
+          
+          # No deletion to avoid downtime during rebuild
+          
+          # Use unique temp cache for each build - no persistence
+          export COMPOSER_HOME=/tmp/composer-$$$$
+          export COMPOSER_CACHE_DIR=$${COMPOSER_HOME}/cache
+          mkdir -p $${COMPOSER_HOME}
+          
+          # Copy GitHub auth
+          if [ -n "$$GITHUB_TOKEN" ]; then
+            echo "{\"github-oauth\":{\"github.com\":\"$$GITHUB_TOKEN\"}}" > $${COMPOSER_HOME}/auth.json
+          fi
+          
+          # Build to a temporary dir then atomically swap to avoid downtime
+          TMP_DIR="/build/output.tmp" && rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR" && \
+          php /satis/bin/satis build /config/satis.json "$TMP_DIR" --no-cache --skip-errors -vvv && \
+          rsync -a --delete "$TMP_DIR"/ /build/output/ && rm -rf "$TMP_DIR"
+          
+          # Cleanup temp cache
+          rm -rf $${COMPOSER_HOME}
+          exit_code=$$?
+          if [ $$exit_code -eq 0 ]; then
+            echo "Build completed successfully at $$(date)"
+            ls -lah /build/output/
+          else
+            echo "Build failed with exit code $$exit_code at $$(date)"
+          fi
+          echo "Sleeping for $${SATIS_BUILD_INTERVAL:-900} seconds..."
+          sleep $${SATIS_BUILD_INTERVAL:-900}
+        done
+    restart: unless-stopped
+
+  satis-web:
+    image: nginx:alpine
+    depends_on:
+      - satis-builder
+    environment:
+      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
+    volumes:
+      - dist:/usr/share/nginx/html:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/nginx/conf.d
+        
+        if [ -n "$$ACCESS_TOKEN" ]; then
+          echo "Setting up token-based authentication"
+          
+          cat > /etc/nginx/conf.d/default.conf << 'EOFNGINX'
+        map_hash_bucket_size 128;
+        
+        map $$arg_token $$token_valid_query {
+            default 0;
+            "ACCESS_TOKEN_PLACEHOLDER" 1;
+        }
+        
+        map $$http_authorization $$token_valid_bearer {
+            default 0;
+            "Bearer ACCESS_TOKEN_PLACEHOLDER" 1;
+        }
+        
+        server {
+            listen 80;
+            server_name _;
+            root /usr/share/nginx/html;
+            index index.html;
+            
+            set $$token_valid 0;
+            
+            # Check token in query parameter OR Bearer header
+            if ($$token_valid_query = 1) {
+                set $$token_valid 1;
+            }
+            if ($$token_valid_bearer = 1) {
+                set $$token_valid 1;
+            }
+            
+            if ($$token_valid = 0) {
+                return 401 "Unauthorized - Invalid or missing token";
+            }
+            
+            location / {
+                try_files $$uri $$uri/ /index.html =404;
+            }
+            
+            # Security headers
+            add_header X-Content-Type-Options nosniff;
+            add_header X-Frame-Options DENY;
+        }
+        EOFNGINX
+          
+          # Replace placeholder with actual token
+          sed -i "s|ACCESS_TOKEN_PLACEHOLDER|$ACCESS_TOKEN|g" /etc/nginx/conf.d/default.conf
+          
+          echo "Token configuration applied. Checking config..."
+          grep -c "$ACCESS_TOKEN" /etc/nginx/conf.d/default.conf || echo "WARNING: Token replacement might have failed!"
+          
+        else
+          echo "WARNING: No ACCESS_TOKEN set - repository is PUBLIC!"
+          cat > /etc/nginx/conf.d/default.conf << 'EOF'
+        server {
+            listen 80;
+            server_name _;
+            root /usr/share/nginx/html;
+            index index.html;
+            
+            location / {
+                try_files $$uri $$uri/ /index.html =404;
+            }
+        }
+        EOF
+        fi
+        
+        echo "Starting nginx..."
+        nginx -g 'daemon off;'
+    expose:
+      - "80"
+    restart: unless-stopped
+    labels:
+      coolify.managed: "true"
+
+volumes:
+  dist:
+  config:
+  satis:
