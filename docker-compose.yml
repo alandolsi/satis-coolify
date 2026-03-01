@@ -85,7 +85,7 @@ services:
           php /satis/bin/satis build /config/satis.json "$$TMP_DIR" --no-cache --skip-errors -vvv
           exit_code=$$?
           if [ $$exit_code -eq 0 ]; then
-            rsync -a --delete "$$TMP_DIR"/ /build/output/
+            cp -a "$$TMP_DIR"/. /build/output/
           fi
           rm -rf "$$TMP_DIR"
           if [ $$exit_code -eq 0 ]; then
