@@ -21,6 +21,7 @@ services:
       - -c
       - |
         set -e
+        apk add --no-cache rsync >/dev/null 2>&1 || echo "WARN: rsync install failed, falling back to cp"
         mkdir -p /composer-auth
         echo '{}' > /composer-auth/composer.json
 
@@ -79,14 +80,25 @@ services:
           export COMPOSER_CACHE_DIR=/composer-auth/cache
           mkdir -p "$$COMPOSER_CACHE_DIR"
 
-          # Build to a temporary dir then atomically swap to avoid downtime
+          # Build to a temporary dir, then sync per-file-atomically into the docroot.
+          # Existing dist archives are seeded into the tmp dir so Satis re-uses them:
+          # -> checksums stay STABLE across builds (composer.lock bleibt gueltig)
+          # -> only genuinely new versions get archived
           TMP_DIR="/build/output.tmp"
-          rm -rf "$$TMP_DIR" && mkdir -p "$$TMP_DIR"
+          rm -rf "$$TMP_DIR" && mkdir -p "$$TMP_DIR/dist"
+          if [ -d /build/output/dist ]; then
+            cp -a /build/output/dist/. "$$TMP_DIR/dist/" 2>/dev/null || true
+          fi
           php /satis/bin/satis build /config/satis.json "$$TMP_DIR" --skip-errors -vvv
           exit_code=$$?
           if [ $$exit_code -eq 0 ]; then
-            rm -rf /build/output/*
-            cp -a "$$TMP_DIR"/. /build/output/
+            if command -v rsync >/dev/null 2>&1; then
+              # rsync writes tmp files + atomic rename per file; deletions happen last.
+              # No rm-rf/copy window -> consumers can never download a truncated tar.
+              rsync -a --delete-delay "$$TMP_DIR"/ /build/output/
+            else
+              cp -a "$$TMP_DIR"/. /build/output/
+            fi
           fi
           rm -rf "$$TMP_DIR"
           if [ $$exit_code -eq 0 ]; then
